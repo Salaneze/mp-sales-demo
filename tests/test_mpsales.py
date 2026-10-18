@@ -1,4 +1,5 @@
 """python -m unittest"""
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -6,11 +7,13 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 from openpyxl import load_workbook
 
 from mpsales import notify, report, store
 from mpsales.models import Order, Stock
 from mpsales.sources import demo
+from mpsales.sources import ozon
 from mpsales.sources.wb import WB, parse_remains
 
 T0 = datetime(2026, 10, 18, 12, 0)
@@ -57,6 +60,72 @@ class WbParseTest(unittest.TestCase):
         stocks = parse_remains(rows)
         self.assertEqual({s.warehouse for s in stocks}, {"Склад WB РФ", "Минск"})
         self.assertEqual(sum(s.qty for s in stocks), 257)
+
+
+class OzonParseTest(unittest.TestCase):
+    # Поля — как в docs.ozon.ru/api/seller/swagger.json (18.10.2026)
+    FBS = {
+        "posting_number": "05708065-0029-1", "status": "cancelled_from_split_pending",
+        "in_process_at": "2026-10-18T09:00:00Z",
+        "delivery_method": {"warehouse": "Склад на Ленина"},
+        "products": [
+            {"offer_id": "RUN-42", "name": "Кроссовки", "sku": 1, "quantity": 2,
+             "price": {"amount": "3490.00", "currency": "RUB"}},
+            {"offer_id": "CAP-01", "name": "Кепка", "sku": 2, "quantity": 1,
+             "price": {"amount": "790.50", "currency": "RUB"}},
+        ],
+    }
+    FBO = {
+        "posting_number": "1-2-3", "status": "delivered", "created_at": "2026-10-18T08:00:00Z",
+        "analytics_data": {"warehouse_name": "ХОРУГВИНО_РФЦ"},
+        "products": [{"offer_id": "TEE-M", "name": "Футболка", "sku": 3, "quantity": 1,
+                      "price": {"amount": "890", "currency": "RUB"}}],
+    }
+
+    def test_posting_split_per_unit(self):
+        orders = ozon.posting_orders(self.FBS, "fbs")
+        # 2 кроссовки + 1 кепка = три единицы с разными ключами
+        self.assertEqual(len(orders), 3)
+        self.assertEqual(len({o.order_id for o in orders}), 3)
+        self.assertTrue(all(o.cancelled for o in orders))  # отмена из-за разделения — тоже отмена
+        self.assertEqual(sum(o.price for o in orders), Decimal("7770.50"))
+        self.assertEqual(orders[0].warehouse, "Склад на Ленина (FBS)")
+
+    def test_fbo_warehouse_from_analytics(self):
+        o = ozon.posting_orders(self.FBO, "fbo")[0]
+        self.assertEqual(o.warehouse, "ХОРУГВИНО_РФЦ (FBO)")
+        self.assertFalse(o.cancelled)
+
+    def test_own_stock_minus_reserved(self):
+        items = [{"offer_id": "RUN-42", "product_id": 10, "stocks": [
+                     {"type": "fbs", "present": 10, "reserved": 3, "sku": 1},
+                     {"type": "fbo", "present": 50, "reserved": 0, "sku": 1}]},
+                 {"offer_id": "CAP-01", "product_id": 11, "stocks": [
+                     {"type": "rfbs", "present": 1, "reserved": 4, "sku": 2}]}]
+        own, skus = ozon.parse_own_stocks(items)
+        self.assertEqual({s.sku: s.qty for s in own}, {"RUN-42": 7, "CAP-01": 0})
+        self.assertEqual(skus, [1])  # FBO-остаток берём из аналитики, не отсюда
+
+    def test_orders_paginate_and_look_back(self):
+        calls = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            body = json.loads(req.content)
+            calls.append((req.url.path, body))
+            if req.url.path == "/v4/posting/fbs/list" and not body.get("cursor"):
+                return httpx.Response(200, json={"postings": [self.FBS], "has_next": True, "cursor": "p2"})
+            if req.url.path == "/v4/posting/fbs/list":
+                return httpx.Response(200, json={"postings": [], "has_next": False, "cursor": ""})
+            return httpx.Response(200, json={"postings": [self.FBO], "has_next": False})
+
+        api = ozon.Ozon("1", "k", httpx.Client(base_url=ozon.API, transport=httpx.MockTransport(handler)))
+        orders = api.orders(T0 - timedelta(hours=1), T0)
+        self.assertEqual(len(orders), 4)
+        self.assertEqual([c[0] for c in calls], ["/v4/posting/fbs/list"] * 2 + ["/v3/posting/fbo/list"])
+        # Окно в час растянуто до трёх дней — иначе вчерашний заказ, отменённый сегодня, не увидим
+        since = datetime.fromisoformat(calls[0][1]["filter"]["since"].replace("Z", "+00:00"))
+        self.assertLessEqual(since.astimezone().replace(tzinfo=None), T0 - ozon.LOOKBACK)
+        self.assertTrue(calls[2][1]["with"]["analytics_data"])
 
 
 class StoreTest(unittest.TestCase):

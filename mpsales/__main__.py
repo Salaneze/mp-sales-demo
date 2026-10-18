@@ -1,5 +1,6 @@
 """python -m mpsales --demo          один проход на тестовом магазине
 python -m mpsales                 один проход по кабинету WB (нужен WB_TOKEN)
+python -m mpsales --mp ozon       то же по Ozon (OZON_CLIENT_ID, OZON_API_KEY)
 python -m mpsales --every 1h      по расписанию
 python -m mpsales --summary       итоги дня в Telegram (для cron вечером)
 """
@@ -21,10 +22,22 @@ log = logging.getLogger("mpsales")
 OVERLAP = timedelta(minutes=40)
 
 
-def run_once(use_demo: bool, now: datetime | None = None) -> list[str]:
+def source(mp: str):
+    if mp == "ozon":
+        from .sources.ozon import Ozon
+        if not (settings.ozon_client_id and settings.ozon_api_key):
+            raise SystemExit("Нет OZON_CLIENT_ID / OZON_API_KEY в .env — или запустите с --demo")
+        return Ozon(settings.ozon_client_id, settings.ozon_api_key)
+    from .sources.wb import WB
+    if not settings.wb_token:
+        raise SystemExit("Нет WB_TOKEN в .env — или запустите с --demo")
+    return WB(settings.wb_token)
+
+
+def run_once(use_demo: bool, now: datetime | None = None, market: str | None = None) -> list[str]:
     now = now or datetime.now()
     db = store.connect(settings.db_path)
-    mp = "demo" if use_demo else "wb"
+    mp = "demo" if use_demo else (market or settings.mp)
     try:
         last = store.get_state(db, f"last_run:{mp}")
         first_run = last is None
@@ -33,14 +46,11 @@ def run_once(use_demo: bool, now: datetime | None = None) -> list[str]:
         if use_demo:
             orders = demo.orders(mp, since, now)
         else:
-            from .sources.wb import WB
-            if not settings.wb_token:
-                raise SystemExit("Нет WB_TOKEN в .env — или запустите с --demo")
-            wb = WB(settings.wb_token)
-            orders = wb.orders(since)
+            api = source(mp)
+            orders = api.orders(since)
         new, cancelled = store.save_orders(db, orders)
 
-        stocks = demo.stocks(mp, store.sold_by_sku(db, mp)) if use_demo else wb.stocks()
+        stocks = demo.stocks(mp, store.sold_by_sku(db, mp)) if use_demo else api.stocks()
         before = store.save_stocks(db, mp, stocks)
         after = store.totals(db, mp)
         names = {s.sku: s.name for s in stocks}
@@ -100,6 +110,7 @@ def main() -> int:
 
     ap = argparse.ArgumentParser(prog="python -m mpsales")
     ap.add_argument("--demo", action="store_true", help="тестовый магазин вместо кабинета")
+    ap.add_argument("--mp", choices=["wb", "ozon"], help="кабинет: wb или ozon (по умолчанию MP из .env)")
     ap.add_argument("--every", type=parse_interval, help="повторять: 30m, 1h")
     ap.add_argument("--summary", action="store_true", help="итоги дня в Telegram")
     # Только для показа: перемотать тестовый магазин вперёд и увидеть,
@@ -113,11 +124,11 @@ def main() -> int:
         send_summary(args.now)
         return 0
     if not args.every:
-        run_once(args.demo, args.now)
+        run_once(args.demo, args.now, args.mp)
         return 0
     while True:
         try:
-            run_once(args.demo)
+            run_once(args.demo, market=args.mp)
         except Exception:
             log.exception("проход упал, следующий по расписанию")
         time.sleep(args.every)

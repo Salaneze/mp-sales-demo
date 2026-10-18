@@ -9,7 +9,11 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:
+    # Какой кабинет читать без --demo: wb или ozon
+    mp: str = os.getenv("MP", "wb")
     wb_token: str = os.getenv("WB_TOKEN", "")
+    ozon_client_id: str = os.getenv("OZON_CLIENT_ID", "")
+    ozon_api_key: str = os.getenv("OZON_API_KEY", "")
     # Ниже этого остатка (сумма по всем складам) приходит «заканчивается»
     low_stock: int = int(os.getenv("LOW_STOCK", "5"))
     db_path: Path = Path(os.getenv("DB_PATH", "data/sales.db"))
